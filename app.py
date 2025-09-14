@@ -159,26 +159,92 @@ BASE = """
 <head>
   <meta charset="utf-8">
   <title>Inspection Scheduler</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 24px; }
-    a { text-decoration: none; }
-    .topnav a { margin-right: 12px; }
-    .card { border:1px solid #ddd; border-radius:12px; padding:16px; margin: 12px 0; }
-    .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(260px,1fr)); gap:12px; }
-    label { display:block; font-weight:600; margin-top:8px;}
-    input, select, textarea { width:100%; padding:8px; border:1px solid #bbb; border-radius:8px; }
-    .btn { display:inline-block; padding:8px 14px; border-radius:8px; border:1px solid #444; background:#f6f6f6; cursor:pointer; }
-    .danger { background:#ffe9e9; border-color:#b00; color:#b00; }
-    .muted { color:#666; }
-    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap;}
-    form.inline { display:inline; }
-    table { width:100%; border-collapse: collapse; }
-    th, td { border-top:1px solid #eee; padding:8px 6px; text-align:left; }
-    thead th { border-bottom:2px solid #ddd; }
-    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid #bbb; font-size:12px; }
-    .pill-oos { background:#fff4f4; border-color:#d66; color:#b00; }
-    .note { font-size:12px; color:#666; margin-top:4px; }
-    .tiny { font-size:12px; }
+    <style>
+    :root{
+      --bg:#f7f8fb;
+      --text:#0f172a;
+      --muted:#64748b;
+      --card:#ffffff;
+      --border:#e5e7eb;
+      --accent:#2563eb;
+      --accent-600:#1e40af;
+      --warn:#b91c1c;
+    }
+    *{box-sizing:border-box}
+    body{
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      background:var(--bg); color:var(--text);
+      margin:24px;
+    }
+    a{ text-decoration:none; color:var(--accent); }
+    a:hover{ text-decoration:underline; }
+    .topnav a{ margin-right:14px; font-weight:600; }
+
+    .card{
+      background:var(--card);
+      border:1px solid var(--border);
+      border-radius:14px;
+      padding:16px 18px;
+      box-shadow: 0 1px 2px rgba(0,0,0,.03);
+      margin:14px 0;
+    }
+
+    h1{ font-size:28px; margin: 6px 0 14px; }
+    h2{ font-size:20px; margin: 6px 0 10px; }
+    h3{ font-size:16px; margin: 4px 0 8px; }
+
+    label{ display:block; font-weight:600; color:var(--text); margin-bottom:6px;}
+    input, select, textarea{
+      width:100%; padding:9px 10px; border-radius:10px;
+      border:1px solid var(--border); background:#fff; color:var(--text);
+      outline:none;
+    }
+    input:focus, select:focus, textarea:focus{
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(37,99,235,.15);
+    }
+    textarea{ resize:vertical; }
+
+    .btn{
+      display:inline-block; padding:9px 14px; border-radius:10px; border:1px solid var(--border);
+      background:#fff; color:var(--text); cursor:pointer; font-weight:600;
+    }
+    .btn:hover{ background:#f4f6fb; }
+    .btn.primary{ background:var(--accent); border-color:var(--accent); color:#fff; }
+    .btn.primary:hover{ background:var(--accent-600); border-color:var(--accent-600); }
+    .btn.danger{ background:#fef2f2; border-color:#fecaca; color:var(--warn); }
+
+    /* Dashboard tables */
+    table{ width:100%; border-collapse:collapse; }
+    thead th{
+      text-align:left; font-size:12px; letter-spacing:.02em; color:var(--muted);
+      border-bottom:1px solid var(--border); padding:8px 6px;
+      position:sticky; top:0; background:#fff;
+    }
+    td{ padding:10px 6px; border-top:1px solid var(--border); vertical-align:top; }
+    tr:hover td{ background:#fafbff; }
+
+    .pill{ display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--border); font-size:12px; color:var(--muted); }
+    .pill-oos{ background:#fff1f2; border-color:#fecaca; color:#b91c1c; }
+
+    .muted{ color:var(--muted); }
+    .row{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+
+    /* Aligned “sheet” for Add Meter row */
+    .sheet{ table-layout:fixed; }
+    .sheet td, .sheet th{ padding:8px 6px; }
+    .sheet input, .sheet select{ width:100%; }
+    .sheet .tight{ width: 120px; }
+
+    /* Notes row spans full width but looks connected */
+    .notes-wrap{
+      border:1px solid var(--border);
+      border-top:none;
+      padding:10px; border-radius:0 0 12px 12px; background:#fff;
+    }
+    .notes-wrap textarea{ width:100%; }
+    .note{ font-size:12px; color:var(--muted); margin-top:4px; }
+    .tiny{ font-size:12px; }
   </style>
 </head>
 <body>
