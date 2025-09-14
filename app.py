@@ -159,7 +159,7 @@ BASE = """
 <head>
   <meta charset="utf-8">
   <title>Inspection Scheduler</title>
-    <style>
+   <style>
     :root{
       --bg:#f7f8fb;
       --text:#0f172a;
@@ -589,35 +589,65 @@ BATTERY_DETAIL = """
   <div class="card">
     <h3>Add Meter to {{ battery.name }}</h3>
     <form method="post" action="{{ url_for('add_meter', battery_id=battery.id) }}">
-      <div class="grid">
-        <div><label>Meter Name</label><input name="meter_name" required /></div>
-        <div><label>Flow Cal ID</label><input name="flow_cal_id" /></div>
-        <div><label>Purchaser Name (optional)</label><input name="purchaser_name" /></div>
-        <div><label>Purchaser Meter ID (optional)</label><input name="purchaser_meter_id" /></div>
-        <div><label>Meter Type</label><input name="meter_type" /></div>
-        <div><label>Meter Address</label><input name="meter_address" /></div>
-        <div><label>Device S/N</label><input name="serial_number" /></div>
-        <div><label>Tube S/N</label><input name="tube_serial_number" /></div>
-        <div><label>Tube Size</label><input name="tube_size" /></div>
-        <div><label>Orifice/Plate Size</label><input name="orifice_plate_size" /></div>
-        <div><label>H2S (PPM)</label><input name="h2s_ppm" /></div>
-        <div>
-          <label>Inspection Frequency</label>
-          <select name="frequency">
-            <option value="">—</option>
-            <option>Monthly</option>
-            <option>Quarterly</option>
-            <option>Semiannual</option>
-            <option>Annual</option>
-            <option>Out of Service</option>
-          </select>
-        </div>
-        <div><label>Last Test (YYYY-MM-DD)</label><input name="last_test_date" placeholder="2025-02-26" /></div>
+      <table class="sheet">
+        <colgroup>
+          <col><col class="tight"><col><col>
+          <col><col><col><col>
+          <col class="tight"><col class="tight">
+          <col class="tight"><col class="tight">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>Meter Name</th>
+            <th>Flow Cal ID</th>
+            <th>Purchaser Name</th>
+            <th>Purchaser Meter ID</th>
+            <th>Meter Type</th>
+            <th>Meter Address</th>
+            <th>Device S/N</th>
+            <th>Tube S/N</th>
+            <th>Tube Size</th>
+            <th>Orifice/Plate Size</th>
+            <th>H2S (PPM)</th>
+            <th>Frequency</th>
+            <th>Last Test</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><input name="meter_name" required></td>
+            <td><input name="flow_cal_id"></td>
+            <td><input name="purchaser_name"></td>
+            <td><input name="purchaser_meter_id"></td>
+            <td><input name="meter_type"></td>
+            <td><input name="meter_address"></td>
+            <td><input name="serial_number"></td>
+            <td><input name="tube_serial_number"></td>
+            <td><input name="tube_size"></td>
+            <td><input name="orifice_plate_size"></td>
+            <td><input name="h2s_ppm"></td>
+            <td>
+              <select name="frequency">
+                <option value="">—</option>
+                <option>Monthly</option>
+                <option>Quarterly</option>
+                <option>Semiannual</option>
+                <option>Annual</option>
+                <option>Out of Service</option>
+              </select>
+            </td>
+            <td><input name="last_test_date" placeholder="YYYY-MM-DD"></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notes-wrap">
+        <label class="tiny"><input type="checkbox" name="hist_add"> Also add this to history</label>
+        <div class="note">Next Inspection is auto-calculated from <b>Last Test</b> + <b>Frequency</b>.</div>
+        <label style="margin-top:10px;">Notes</label>
+        <textarea name="notes" rows="2"></textarea>
+        <p style="margin-top:10px;"><button class="btn primary">Add Meter</button></p>
       </div>
-      <label class="tiny"><input type="checkbox" name="hist_add" /> Also add this to history</label>
-      <div class="note">Next Inspection is auto-calculated from <b>Last Test</b> + <b>Frequency</b>.</div>
-      <label>Notes</label><textarea name="notes" rows="2"></textarea>
-      <p><button class="btn">Add Meter</button></p>
     </form>
   </div>
 
@@ -632,7 +662,7 @@ BATTERY_DETAIL = """
         {% endif %}
         <div class="muted">Type: {{ m.meter_type or '—' }} | Addr: {{ m.meter_address or '—' }}</div>
         <div class="muted">Tube: {{ m.tube_size or '—' }} | Plate: {{ m.orifice_plate_size or '—' }} | H2S: {{ m.h2s_ppm or '—' }}</div>
-        <div class="muted">Last Test: {{ m.last_test_date or '—' }}</div>
+        <div class="muted">Last Test: {{ m.last_test_date or '—' }} | Next Insp: {{ m.next_inspection or '—' }}</div>
         {% if m.frequency %}
           {% if m.frequency == 'Out of Service' %}
             <div><span class="pill pill-oos">Out of Service</span></div>
@@ -640,7 +670,6 @@ BATTERY_DETAIL = """
             <div class="muted">Frequency: {{ m.frequency }}</div>
           {% endif %}
         {% endif %}
-        <div class="muted">Next Insp: {{ m.next_inspection or '—' }}</div>
         {% if m.notes %}<p>{{ m.notes }}</p>{% endif %}
         <p class="row">
           <a class="btn" href="{{ url_for('edit_meter', meter_id=m.id) }}">Edit</a>
@@ -651,11 +680,12 @@ BATTERY_DETAIL = """
         </p>
       </div>
     {% else %}
-      <p>No meters yet.</p>
+      <p class="muted">No meters yet.</p>
     {% endfor %}
   </div>
 {% endblock %}
 """
+
 
 METER_EDIT = """
 {% extends "base.html" %}
@@ -1041,4 +1071,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting on port {port} — DB: {DB_URI}")
     app.run(host="0.0.0.0", port=port, debug=False)
-
