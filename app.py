@@ -1,634 +1,978 @@
-# app.py
-# Lightweight multi-user meter tracker with Eagleville/Eagleford, Excel import, CSV export.
-# Run: pip install flask sqlalchemy pandas openpyxl
-# Then: python app.py
-
-import csv
-import io
 import os
-from datetime import datetime
-from typing import Optional, Dict
+import calendar
+from pathlib import Path
+from datetime import date, datetime, timedelta
+from flask import Flask, request, redirect, url_for, render_template_string, flash
+from flask_sqlalchemy import SQLAlchemy
+from jinja2 import DictLoader, ChoiceLoader
+from sqlalchemy.orm import joinedload
+from sqlalchemy import inspect
 
-from flask import (
-    Flask, request, redirect, url_for, render_template_string,
-    send_file, flash
-)
-from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, Date, Text, Enum
-)
-from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
-from sqlalchemy.exc import IntegrityError
-import pandas as pd
-
-# -------------------- Config --------------------
-DATABASE_URL = "sqlite:///meters.db"   # change filename if you want to "rename db"
-ALLOWED_STATIONS = ("Eagleville", "Eagleford")
+# ------------------------
+# Database config (Railway-ready)
+# ------------------------
+DB_URL = os.environ.get("DATABASE_URL")
+if DB_URL:
+    # Railway/Heroku sometimes provide 'postgres://'
+    DB_URI = DB_URL.replace("postgres://", "postgresql://")
+else:
+    _raw = os.environ.get("INSPECT_DB_PATH", "inspections.db")
+    base_dir = Path(__file__).resolve().parent
+    db_path = Path(_raw)
+    if not db_path.is_absolute():
+        db_path = base_dir / db_path
+    DB_URI = "sqlite:///" + str(db_path).replace("\\", "/")
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-key")
+app.config["SQLALCHEMY_DATABASE_URI"] = DB_URI
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "devkey")
+db = SQLAlchemy(app)
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False}  # fine for small multi-user setups
-)
-Session = scoped_session(sessionmaker(bind=engine))
-Base = declarative_base()
+# ------------------------
+# Helpers & constants
+# ------------------------
+FREQ_MONTHS = {"Monthly": 1, "Quarterly": 3, "Semiannual": 6, "Annual": 12}
+QUICK_REASONS = [
+    "—",
+    "No flow",
+    "Valve closed",
+    "Shutdown/maintenance",
+    "Access blocked",
+    "Unsafe conditions",
+    "Customer requested skip",
+    "Instrument offline",
+    "Other",
+]
 
-
-# -------------------- Model --------------------
-class Meter(Base):
-    __tablename__ = "meters"
-
-    id = Column(Integer, primary_key=True)
-    station = Column(Enum(*ALLOWED_STATIONS, name="station_enum"), nullable=False)
-
-    meter_name = Column(String(200), nullable=False)
-    flow_cal_id = Column(String(200), nullable=True)
-
-    test_date = Column(Date, nullable=True)
-    h2s_ppm = Column(Float, nullable=True)
-
-    meter_type = Column(String(200), nullable=True)
-    meter_address = Column(String(200), nullable=True)
-
-    serial_number = Column(String(200), nullable=True)
-    tube_serial_number = Column(String(200), nullable=True)
-
-    tube_size = Column(String(100), nullable=True)
-    orifice_plate_size = Column(String(100), nullable=True)
-
-    notes = Column(Text, nullable=True)
-
-
-Base.metadata.create_all(engine)
-
-
-# -------------------- Helpers --------------------
-def parse_date(s: Optional[str]) -> Optional[datetime.date]:
-    if not s or str(s).strip() == "":
+def parse_ymd(s: str):
+    s = (s or "").strip()
+    if not s:
         return None
-    # Try multiple formats
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(str(s).strip(), fmt).date()
-        except ValueError:
-            continue
-    # Try pandas to_datetime fallback (handles Excel serials too)
     try:
-        return pd.to_datetime(s).date()
+        y, m, d = [int(x) for x in s.split("-")]
+        return date(y, m, d)
     except Exception:
         return None
 
+def add_months(d: date, months: int) -> date:
+    m0 = d.month - 1 + months
+    y = d.year + (m0 // 12)
+    m = (m0 % 12) + 1
+    last_day = calendar.monthrange(y, m)[1]
+    return date(y, m, min(d.day, last_day))
 
-def parse_float(s: Optional[str]) -> Optional[float]:
-    if s is None or str(s).strip() == "":
+def compute_next(last_test: date, freq: str):
+    if not last_test or not freq or freq == "Out of Service":
         return None
-    try:
-        return float(str(s).strip())
-    except ValueError:
-        return None
+    months = FREQ_MONTHS.get(freq)
+    return add_months(last_test, months) if months else None
 
+def week_bounds(ref: date | None = None):
+    today = ref or date.today()
+    start = today - timedelta(days=today.weekday())  # Monday
+    end = start + timedelta(days=6)                  # Sunday
+    return start, end
 
-# Mapping possible Excel header variations -> canonical field names
-HEADER_MAP: Dict[str, str] = {
-    # station
-    "station": "station",
+# ------------------------
+# Models
+# ------------------------
+class Field(db.Model):
+    __tablename__ = "fields"
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), unique=True, nullable=False)
+    location = db.Column(db.String(200))
+    batteries = db.relationship("Battery", backref="field", cascade="all, delete-orphan")
 
-    # core fields
-    "meter name": "meter_name",
-    "meter_name": "meter_name",
+class Battery(db.Model):
+    __tablename__ = "batteries"
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(160), nullable=False)
+    notes = db.Column(db.String(500))
+    field_id = db.Column(db.Integer, db.ForeignKey("fields.id"), nullable=False)
+    meters = db.relationship("Meter", backref="battery", cascade="all, delete-orphan")
 
-    "flow cal id": "flow_cal_id",
-    "flow_cal_id": "flow_cal_id",
-    "flowcal id": "flow_cal_id",
+class Meter(db.Model):
+    __tablename__ = "meters"
+    id = db.Column(db.Integer, primary_key=True)
+    meter_name = db.Column(db.String(160), nullable=False)
+    flow_cal_id = db.Column(db.String(120))
+    purchaser_name = db.Column(db.String(160))       # optional
+    purchaser_meter_id = db.Column(db.String(120))   # optional
+    meter_type = db.Column(db.String(120))
+    meter_address = db.Column(db.String(200))
+    serial_number = db.Column(db.String(120))
+    tube_serial_number = db.Column(db.String(120))
+    tube_size = db.Column(db.String(80))
+    orifice_plate_size = db.Column(db.String(80))
+    h2s_ppm = db.Column(db.String(40))
+    notes = db.Column(db.String(1000))
+    last_test_date = db.Column(db.Date)
+    next_inspection = db.Column(db.Date)
+    frequency = db.Column(db.String(40))  # "", Monthly, Quarterly, Semiannual, Annual, Out of Service
+    battery_id = db.Column(db.Integer, db.ForeignKey("batteries.id"), nullable=False)
+    history = db.relationship(
+        "MeterHistory",
+        backref="meter",
+        cascade="all, delete-orphan",
+        order_by="desc(MeterHistory.event_date)",
+    )
 
-    "test date": "test_date",
-    "test_date": "test_date",
-    "test dates": "test_date",
+class MeterHistory(db.Model):
+    __tablename__ = "meter_history"
+    id = db.Column(db.Integer, primary_key=True)
+    meter_id = db.Column(db.Integer, db.ForeignKey("meters.id"), nullable=False, index=True)
+    event_date = db.Column(db.Date, nullable=False)
+    h2s_ppm = db.Column(db.String(40))
+    notes = db.Column(db.String(1000))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_via = db.Column(db.String(40))  # 'manual' | 'mark_tested' | 'edit'
 
-    "h2s": "h2s_ppm",
-    "h2s ppm": "h2s_ppm",
-    "h2s_ppm": "h2s_ppm",
+# ------------------------
+# DB bootstrap + tiny migrations
+# ------------------------
+with app.app_context():
+    db.create_all()
+    # default fields
+    for fname in ["Eagleville", "Eagleford"]:
+        if not Field.query.filter_by(name=fname).first():
+            db.session.add(Field(name=fname))
+    db.session.commit()
 
-    "meter type": "meter_type",
-    "meter_type": "meter_type",
+    # lightweight column adders for older DBs
+    insp = inspect(db.engine)
+    cols = {c["name"] for c in insp.get_columns("meters")}
+    with db.engine.begin() as conn:
+        if "last_test_date" not in cols:
+            conn.exec_driver_sql("ALTER TABLE meters ADD COLUMN last_test_date DATE")
+        if "purchaser_name" not in cols:
+            conn.exec_driver_sql("ALTER TABLE meters ADD COLUMN purchaser_name VARCHAR(160)")
+        if "purchaser_meter_id" not in cols:
+            conn.exec_driver_sql("ALTER TABLE meters ADD COLUMN purchaser_meter_id VARCHAR(120)")
 
-    "meter address": "meter_address",
-    "meter_address": "meter_address",
-    "address": "meter_address",
-
-    "serial number": "serial_number",
-    "device s/n": "serial_number",
-    "serial_number": "serial_number",
-
-    "tube serial number": "tube_serial_number",
-    "tube s/n": "tube_serial_number",
-    "tube_serial_number": "tube_serial_number",
-
-    "tube size": "tube_size",
-    "tube_size": "tube_size",
-
-    "orifice plate size": "orifice_plate_size",
-    "orifice/plate size": "orifice_plate_size",
-    "orifice_plate_size": "orifice_plate_size",
-
-    "notes": "notes",
-    "comments": "notes",
-}
-
-
-def normalize_header(h: str) -> str:
-    return str(h).strip().lower().replace("\n", " ").replace("\r", " ").replace("  ", " ")
-
-
-# -------------------- Routes --------------------
-@app.route("/")
-def home():
-    return redirect(url_for("list_by_station", station="Eagleville"))
-
-
-@app.route("/station/<station>")
-def list_by_station(station: str):
-    if station not in ALLOWED_STATIONS:
-        flash("Unknown station.", "danger")
-        return redirect(url_for("home"))
-    s = Session()
-    try:
-        items = (
-            s.query(Meter)
-            .filter(Meter.station == station)
-            .order_by(Meter.meter_name.asc())
-            .all()
-        )
-    finally:
-        s.close()
-    return render_template_string(TEMPLATE, active_station=station, items=items, stations=ALLOWED_STATIONS)
-
-
-@app.route("/add", methods=["POST"])
-def add_meter():
-    s = Session()
-    try:
-        station = request.form.get("station")
-        if station not in ALLOWED_STATIONS:
-            flash("Invalid station.", "danger")
-            return redirect(url_for("home"))
-
-        m = Meter(
-            station=station,
-            meter_name=request.form.get("meter_name", "").strip() or "Unnamed",
-            flow_cal_id=request.form.get("flow_cal_id", "").strip() or None,
-            test_date=parse_date(request.form.get("test_date")),
-            h2s_ppm=parse_float(request.form.get("h2s_ppm")),
-            meter_type=request.form.get("meter_type", "").strip() or None,
-            meter_address=request.form.get("meter_address", "").strip() or None,
-            serial_number=request.form.get("serial_number", "").strip() or None,
-            tube_serial_number=request.form.get("tube_serial_number", "").strip() or None,
-            tube_size=request.form.get("tube_size", "").strip() or None,
-            orifice_plate_size=request.form.get("orifice_plate_size", "").strip() or None,
-            notes=request.form.get("notes", "").strip() or None,
-        )
-        s.add(m)
-        s.commit()
-        flash("Meter added.", "success")
-        return redirect(url_for("list_by_station", station=station))
-    except IntegrityError:
-        s.rollback()
-        flash("Failed to add meter due to a database error.", "danger")
-        return redirect(url_for("home"))
-    finally:
-        s.close()
-
-
-@app.route("/edit/<int:meter_id>", methods=["POST"])
-def edit_meter(meter_id: int):
-    s = Session()
-    try:
-        m = s.get(Meter, meter_id)
-        if not m:
-            flash("Meter not found.", "danger")
-            return redirect(url_for("home"))
-
-        station = request.form.get("station")
-        if station not in ALLOWED_STATIONS:
-            flash("Invalid station.", "danger")
-            return redirect(url_for("home"))
-
-        m.station = station
-        m.meter_name = request.form.get("meter_name", "").strip() or m.meter_name
-        m.flow_cal_id = request.form.get("flow_cal_id", "").strip() or None
-        m.test_date = parse_date(request.form.get("test_date"))
-        m.h2s_ppm = parse_float(request.form.get("h2s_ppm"))
-        m.meter_type = request.form.get("meter_type", "").strip() or None
-        m.meter_address = request.form.get("meter_address", "").strip() or None
-        m.serial_number = request.form.get("serial_number", "").strip() or None
-        m.tube_serial_number = request.form.get("tube_serial_number", "").strip() or None
-        m.tube_size = request.form.get("tube_size", "").strip() or None
-        m.orifice_plate_size = request.form.get("orifice_plate_size", "").strip() or None
-        m.notes = request.form.get("notes", "").strip() or None
-
-        s.commit()
-        flash("Meter updated.", "success")
-        return redirect(url_for("list_by_station", station=m.station))
-    except IntegrityError:
-        s.rollback()
-        flash("Failed to update meter due to a database error.", "danger")
-        return redirect(url_for("home"))
-    finally:
-        s.close()
-
-
-@app.route("/delete/<int:meter_id>", methods=["POST"])
-def delete_meter(meter_id: int):
-    s = Session()
-    try:
-        m = s.get(Meter, meter_id)
-        if not m:
-            flash("Meter not found.", "warning")
-            return redirect(url_for("home"))
-        station = m.station
-        s.delete(m)
-        s.commit()
-        flash("Meter deleted.", "success")
-        return redirect(url_for("list_by_station", station=station))
-    finally:
-        s.close()
-
-
-@app.route("/import", methods=["POST"])
-def import_excel():
-    file = request.files.get("file")
-    target_station = request.form.get("target_station")
-    if not file or file.filename == "":
-        flash("No file selected.", "warning")
-        return redirect(url_for("home"))
-    if target_station not in ALLOWED_STATIONS:
-        flash("Choose a valid target station for import.", "danger")
-        return redirect(url_for("home"))
-
-    try:
-        df = pd.read_excel(file, engine="openpyxl")
-    except Exception as e:
-        flash(f"Failed to read Excel: {e}", "danger")
-        return redirect(url_for("home"))
-
-    # Normalize headers and map
-    mapped_cols = {}
-    for col in df.columns:
-        norm = normalize_header(col)
-        if norm in HEADER_MAP:
-            mapped_cols[col] = HEADER_MAP[norm]
-
-    if "station" not in [HEADER_MAP.get(normalize_header(c), "") for c in df.columns]:
-        # If file doesn't include station per-row, use target_station for all rows
-        df["__station_fallback__"] = target_station
-        mapped_cols["__station_fallback__"] = "station"
-
-    # Build rows
-    inserted = 0
-    s = Session()
-    try:
-        for _, row in df.iterrows():
-            data = {
-                "station": None,
-                "meter_name": None,
-                "flow_cal_id": None,
-                "test_date": None,
-                "h2s_ppm": None,
-                "meter_type": None,
-                "meter_address": None,
-                "serial_number": None,
-                "tube_serial_number": None,
-                "tube_size": None,
-                "orifice_plate_size": None,
-                "notes": None,
-            }
-
-            for orig_col, mapped in mapped_cols.items():
-                val = row.get(orig_col, None)
-                if mapped == "test_date":
-                    data[mapped] = parse_date(val)
-                elif mapped == "h2s_ppm":
-                    data[mapped] = parse_float(val)
-                elif mapped == "station":
-                    # ensure station is valid, else fallback
-                    st = str(val).strip() if val is not None else target_station
-                    data[mapped] = st if st in ALLOWED_STATIONS else target_station
-                else:
-                    data[mapped] = (None if pd.isna(val) else str(val).strip())
-
-            # Require meter_name minimally
-            if not data["meter_name"]:
-                continue
-
-            m = Meter(**data)
-            s.add(m)
-            inserted += 1
-
-        s.commit()
-        flash(f"Imported {inserted} rows.", "success")
-    except Exception as e:
-        s.rollback()
-        flash(f"Import failed: {e}", "danger")
-    finally:
-        s.close()
-
-    return redirect(url_for("list_by_station", station=target_station))
-
-
-@app.route("/export/<station>.csv")
-def export_csv(station: str):
-    if station not in ALLOWED_STATIONS:
-        flash("Unknown station.", "danger")
-        return redirect(url_for("home"))
-    s = Session()
-    try:
-        items = s.query(Meter).filter(Meter.station == station).all()
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow([
-            "Station", "Meter Name", "Flow Cal ID", "Test Date", "H2S PPM",
-            "Meter Type", "Meter Address", "Serial Number", "Tube Serial Number",
-            "Tube Size", "Orifice Plate Size", "Notes"
-        ])
-        for m in items:
-            writer.writerow([
-                m.station,
-                m.meter_name,
-                m.flow_cal_id or "",
-                m.test_date.isoformat() if m.test_date else "",
-                m.h2s_ppm if m.h2s_ppm is not None else "",
-                m.meter_type or "",
-                m.meter_address or "",
-                m.serial_number or "",
-                m.tube_serial_number or "",
-                m.tube_size or "",
-                m.orifice_plate_size or "",
-                m.notes or "",
-            ])
-        output.seek(0)
-        return send_file(
-            io.BytesIO(output.getvalue().encode("utf-8")),
-            mimetype="text/csv",
-            as_attachment=True,
-            download_name=f"{station}_meters.csv",
-        )
-    finally:
-        s.close()
-
-
-# -------------------- Template (single-file Jinja) --------------------
-TEMPLATE = """
+# ------------------------
+# Templates
+# ------------------------
+BASE = """
 <!doctype html>
-<html lang="en">
+<html>
 <head>
   <meta charset="utf-8">
-  <title>Meter Tracker</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link
-    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
-    rel="stylesheet">
+  <title>Inspection Scheduler</title>
   <style>
-    .form-inline input, .form-inline select { margin-right: .5rem; }
-    .sticky { position: sticky; top: 0; background: #fff; z-index: 10; }
-    textarea { resize: vertical; }
-    .small-note { font-size: .875rem; color: #6c757d; }
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    a { text-decoration: none; }
+    .topnav a { margin-right: 12px; }
+    .card { border:1px solid #ddd; border-radius:12px; padding:16px; margin: 12px 0; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(260px,1fr)); gap:12px; }
+    label { display:block; font-weight:600; margin-top:8px;}
+    input, select, textarea { width:100%; padding:8px; border:1px solid #bbb; border-radius:8px; }
+    .btn { display:inline-block; padding:8px 14px; border-radius:8px; border:1px solid #444; background:#f6f6f6; cursor:pointer; }
+    .danger { background:#ffe9e9; border-color:#b00; color:#b00; }
+    .muted { color:#666; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap;}
+    form.inline { display:inline; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { border-top:1px solid #eee; padding:8px 6px; text-align:left; }
+    thead th { border-bottom:2px solid #ddd; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid #bbb; font-size:12px; }
+    .pill-oos { background:#fff4f4; border-color:#d66; color:#b00; }
+    .note { font-size:12px; color:#666; margin-top:4px; }
+    .tiny { font-size:12px; }
   </style>
 </head>
-<body class="bg-light">
-<div class="container py-4">
-  <div class="d-flex align-items-center justify-content-between mb-3">
-    <h3 class="mb-0">Meter Tracker</h3>
-    <div>
-      <a class="btn btn-outline-secondary me-2" href="{{ url_for('list_by_station', station='Eagleville') }}">Eagleville</a>
-      <a class="btn btn-outline-secondary me-2" href="{{ url_for('list_by_station', station='Eagleford') }}">Eagleford</a>
-      <a class="btn btn-success" href="{{ url_for('export_csv', station=active_station) }}">Export CSV ({{ active_station }})</a>
-    </div>
+<body>
+  <div class="topnav">
+    <a href="{{ url_for('home') }}">Home</a>
+    <a href="{{ url_for('list_fields') }}">Fields</a>
+    <a href="{{ url_for('due') }}">Due This Week</a>
   </div>
-
-  {% with messages = get_flashed_messages(with_categories=True) %}
+  {% with messages = get_flashed_messages() %}
     {% if messages %}
-      {% for category, msg in messages %}
-        <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
-          {{ msg }}
-          <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
-        </div>
-      {% endfor %}
+      <ul>
+      {% for m in messages %}<li>{{ m }}</li>{% endfor %}
+      </ul>
     {% endif %}
   {% endwith %}
+  {% block content %}{% endblock %}
+</body>
+</html>
+"""
 
-  <div class="card mb-4">
-    <div class="card-header">Add Meter ({{ active_station }})</div>
-    <div class="card-body">
-      <form method="post" action="{{ url_for('add_meter') }}" class="row g-2">
-        <input type="hidden" name="station" value="{{ active_station }}">
-        <div class="col-md-3">
-          <label class="form-label">Meter Name *</label>
-          <input name="meter_name" class="form-control" required>
-        </div>
-        <div class="col-md-3">
-          <label class="form-label">Flow Cal ID</label>
-          <input name="flow_cal_id" class="form-control">
-        </div>
-        <div class="col-md-3">
-          <label class="form-label">Test Date</label>
-          <input type="date" name="test_date" class="form-control">
-        </div>
-        <div class="col-md-3">
-          <label class="form-label">H2S PPM</label>
-          <input name="h2s_ppm" class="form-control" inputmode="decimal">
-        </div>
+HOME = """
+{% extends "base.html" %}
+{% block content %}
+  <h1>Inspection Scheduler</h1>
 
-        <div class="col-md-3">
-          <label class="form-label">Meter Type</label>
-          <input name="meter_type" class="form-control">
-        </div>
-        <div class="col-md-3">
-          <label class="form-label">Meter Address</label>
-          <input name="meter_address" class="form-control">
-        </div>
-        <div class="col-md-3">
-          <label class="form-label">Serial Number</label>
-          <input name="serial_number" class="form-control">
-        </div>
-        <div class="col-md-3">
-          <label class="form-label">Tube Serial Number</label>
-          <input name="tube_serial_number" class="form-control">
-        </div>
+  <div class="card">
+    <h2>Tests Due</h2>
+    <div class="muted">Week {{ week_start }} – {{ week_end }}</div>
 
-        <div class="col-md-3">
-          <label class="form-label">Tube Size</label>
-          <input name="tube_size" class="form-control">
-        </div>
-        <div class="col-md-3">
-          <label class="form-label">Orifice Plate Size</label>
-          <input name="orifice_plate_size" class="form-control">
-        </div>
-        <div class="col-md-12">
-          <label class="form-label">Notes</label>
-          <textarea name="notes" class="form-control" rows="2"></textarea>
-        </div>
+    {% if overdue %}
+      <h3 style="margin-top:10px;">Overdue</h3>
+      <table>
+        <thead><tr><th>Field</th><th>Battery</th><th>Meter</th><th>Next Inspection</th><th>Frequency</th><th>Update</th></tr></thead>
+        <tbody>
+          {% for m in overdue %}
+          <tr>
+            <td>{{ m.battery.field.name }}</td>
+            <td>{{ m.battery.name }}</td>
+            <td>{{ m.meter_name }}</td>
+            <td>{{ m.next_inspection }}</td>
+            <td>{{ m.frequency or '—' }}</td>
+            <td>
+              <form class="inline" method="post" action="{{ url_for('mark_tested_today', meter_id=m.id) }}?back=home" onsubmit="return confirm('Mark as tested today?');">
+                <input name="new_h2s" placeholder="H2S" value="{{ m.h2s_ppm or '' }}" style="width:70px; margin-right:6px;">
+                <select name="reason" style="width:170px; margin-right:6px;">
+                  {% for r in quick_reasons %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+                </select>
+                <input name="note" placeholder="note (optional)" style="width:180px; margin-right:6px;">
+                <button class="btn">Mark Tested Today</button>
+              </form>
+              <a class="btn" href="{{ url_for('meter_history', meter_id=m.id) }}">History</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
 
-        <div class="col-12">
-          <button class="btn btn-primary">Add</button>
-        </div>
-      </form>
-    </div>
+    <h3 style="margin-top:10px;">Due This Week</h3>
+    {% if due_week %}
+      <table>
+        <thead><tr><th>Field</th><th>Battery</th><th>Meter</th><th>Next Inspection</th><th>Frequency</th><th>Update</th></tr></thead>
+        <tbody>
+          {% for m in due_week %}
+          <tr>
+            <td>{{ m.battery.field.name }}</td>
+            <td>{{ m.battery.name }}</td>
+            <td>{{ m.meter_name }}</td>
+            <td>{{ m.next_inspection }}</td>
+            <td>{{ m.frequency or '—' }}</td>
+            <td>
+              <form class="inline" method="post" action="{{ url_for('mark_tested_today', meter_id=m.id) }}?back=home" onsubmit="return confirm('Mark as tested today?');">
+                <input name="new_h2s" placeholder="H2S" value="{{ m.h2s_ppm or '' }}" style="width:70px; margin-right:6px;">
+                <select name="reason" style="width:170px; margin-right:6px;">
+                  {% for r in quick_reasons %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+                </select>
+                <input name="note" placeholder="note (optional)" style="width:180px; margin-right:6px;">
+                <button class="btn">Mark Tested Today</button>
+              </form>
+              <a class="btn" href="{{ url_for('meter_history', meter_id=m.id) }}">History</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <div class="muted">No tests due this week.</div>
+    {% endif %}
+    <p style="margin-top:8px;"><a class="btn" href="{{ url_for('due') }}">Open full Due This Week</a></p>
   </div>
 
-  <div class="card mb-4">
-    <div class="card-header d-flex justify-content-between align-items-center">
-      <span>Import from Excel to {{ active_station }}</span>
-      <span class="small-note">Accepted: .xlsx | Columns auto-mapped (e.g., "Meter Name", "Flow Cal ID", "Test Date", "H2S PPM", etc.)</span>
+  <h2 style="margin-top:28px;">Dashboard — Meters by Battery</h2>
+  {% for f in fields %}
+    <div class="card">
+      <h3>{{ f.name }}</h3>
+      {% if f.batteries %}
+        {% for b in f.batteries %}
+          <div class="card" style="margin:12px 0; padding:12px;">
+            <div class="row" style="justify-content:space-between;">
+              <div><strong>{{ b.name }}</strong></div>
+              <div class="muted">{{ b.meters|length }} meter(s)</div>
+            </div>
+
+            {% if b.meters %}
+              <table>
+                <thead>
+                  <tr>
+                    <th>Meter Name</th>
+                    <th>Flow Cal ID</th>
+                    <th>Purchaser</th>
+                    <th>Purchaser Meter ID</th>
+                    <th>Frequency</th>
+                    <th>Last Test</th>
+                    <th>Next Inspection</th>
+                    <th>H2S (PPM)</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for m in b.meters|sort(attribute='meter_name') %}
+                  <tr>
+                    <td>{{ m.meter_name }}</td>
+                    <td>{{ m.flow_cal_id or '—' }}</td>
+                    <td>{{ m.purchaser_name or '—' }}</td>
+                    <td>{{ m.purchaser_meter_id or '—' }}</td>
+                    <td>
+                      {% if (m.frequency or '') == 'Out of Service' %}
+                        <span class="pill pill-oos">Out of Service</span>
+                      {% else %}
+                        {{ m.frequency or '—' }}
+                      {% endif %}
+                    </td>
+                    <td>{{ m.last_test_date or '—' }}</td>
+                    <td>{{ m.next_inspection or '—' }}</td>
+                    <td>{{ m.h2s_ppm or '—' }}</td>
+                    <td class="row">
+                      <a class="btn" href="{{ url_for('edit_meter', meter_id=m.id) }}">Edit</a>
+                      <a class="btn" href="{{ url_for('meter_history', meter_id=m.id) }}">History</a>
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            {% else %}
+              <div class="muted">No meters yet.</div>
+            {% endif %}
+            <p style="margin-top:10px;">
+              <a class="btn" href="{{ url_for('battery_detail', battery_id=b.id) }}">Open {{ b.name }}</a>
+            </p>
+          </div>
+        {% endfor %}
+      {% else %}
+        <div class="muted">No batteries in this field yet.</div>
+      {% endif %}
     </div>
-    <div class="card-body">
-      <form method="post" action="{{ url_for('import_excel') }}" enctype="multipart/form-data" class="row g-2">
-        <div class="col-md-6">
-          <input type="file" name="file" accept=".xlsx" class="form-control" required>
-        </div>
-        <div class="col-md-4">
-          <select name="target_station" class="form-select">
-            {% for s in stations %}
-              <option value="{{ s }}" {% if s == active_station %}selected{% endif %}>{{ s }}</option>
-            {% endfor %}
+  {% endfor %}
+{% endblock %}
+"""
+
+DUE_PAGE = """
+{% extends "base.html" %}
+{% block content %}
+  <h1>Due This Week</h1>
+  <div class="muted">Week {{ week_start }} – {{ week_end }}</div>
+
+  {% if overdue %}
+    <div class="card">
+      <h2>Overdue</h2>
+      <table>
+        <thead><tr><th>Field</th><th>Battery</th><th>Meter</th><th>Next Inspection</th><th>Frequency</th><th>Update</th></tr></thead>
+        <tbody>
+          {% for m in overdue %}
+          <tr>
+            <td>{{ m.battery.field.name }}</td>
+            <td>{{ m.battery.name }}</td>
+            <td>{{ m.meter_name }}</td>
+            <td>{{ m.next_inspection }}</td>
+            <td>{{ m.frequency or '—' }}</td>
+            <td>
+              <form class="inline" method="post" action="{{ url_for('mark_tested_today', meter_id=m.id) }}?back=due" onsubmit="return confirm('Mark as tested today?');">
+                <input name="new_h2s" placeholder="H2S" value="{{ m.h2s_ppm or '' }}" style="width:70px; margin-right:6px;">
+                <select name="reason" style="width:170px; margin-right:6px;">
+                  {% for r in quick_reasons %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+                </select>
+                <input name="note" placeholder="note (optional)" style="width:180px; margin-right:6px;">
+                <button class="btn">Mark Tested Today</button>
+              </form>
+              <a class="btn" href="{{ url_for('meter_history', meter_id=m.id) }}">History</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+
+  <div class="card">
+    <h2>Due This Week</h2>
+    {% if due_week %}
+      <table>
+        <thead><tr><th>Field</th><th>Battery</th><th>Meter</th><th>Next Inspection</th><th>Frequency</th><th>Update</th></tr></thead>
+        <tbody>
+          {% for m in due_week %}
+          <tr>
+            <td>{{ m.battery.field.name }}</td>
+            <td>{{ m.battery.name }}</td>
+            <td>{{ m.meter_name }}</td>
+            <td>{{ m.next_inspection }}</td>
+            <td>{{ m.frequency or '—' }}</td>
+            <td>
+              <form class="inline" method="post" action="{{ url_for('mark_tested_today', meter_id=m.id) }}?back=due" onsubmit="return confirm('Mark as tested today?');">
+                <input name="new_h2s" placeholder="H2S" value="{{ m.h2s_ppm or '' }}" style="width:70px; margin-right:6px;">
+                <select name="reason" style="width:170px; margin-right:6px;">
+                  {% for r in quick_reasons %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+                </select>
+                <input name="note" placeholder="note (optional)" style="width:180px; margin-right:6px;">
+                <button class="btn">Mark Tested Today</button>
+              </form>
+              <a class="btn" href="{{ url_for('meter_history', meter_id=m.id) }}">History</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <div class="muted">No tests due this week.</div>
+    {% endif %}
+  </div>
+{% endblock %}
+"""
+
+FIELDS = """
+{% extends "base.html" %}
+{% block content %}
+  <h1>Fields</h1>
+  <div class="card">
+    <h3>Add Field</h3>
+    <form method="post" action="{{ url_for('add_field') }}">
+      <label>Name</label><input name="name" required />
+      <label>Location</label><input name="location" />
+      <p><button class="btn">Save</button></p>
+    </form>
+  </div>
+  <h2>All Fields</h2>
+  <ul>
+  {% for f in fields %}
+    <li>
+      <a href="{{ url_for('list_batteries', field_id=f.id) }}">{{ f.name }}</a>
+      {% if f.location %}<span class="muted"> — {{ f.location }}</span>{% endif %}
+      &nbsp; <a class="btn" href="{{ url_for('edit_field', field_id=f.id) }}">Edit</a>
+    </li>
+  {% endfor %}
+  </ul>
+{% endblock %}
+"""
+
+FIELD_EDIT = """
+{% extends "base.html" %}
+{% block content %}
+  <h1>Edit Field</h1>
+  <form method="post">
+    <label>Name</label><input name="name" value="{{ field.name }}" required />
+    <label>Location</label><input name="location" value="{{ field.location or '' }}" />
+    <p class="row">
+      <button class="btn">Save Changes</button>
+      <a class="btn" href="{{ url_for('list_batteries', field_id=field.id) }}">Back</a>
+    </p>
+  </form>
+{% endblock %}
+"""
+
+BATTERIES = """
+{% extends "base.html" %}
+{% block content %}
+  <h1>{{ field.name }} — Central Tank Batteries</h1>
+  <p><a href="{{ url_for('list_fields') }}">← back to Fields</a></p>
+
+  <div class="card">
+    <h3>Add Battery</h3>
+    <form method="post" action="{{ url_for('add_battery') }}">
+      <label>Battery Name</label><input name="name" required placeholder="CTB-101" />
+      <label>Assign to Field</label>
+      <select name="field_id" required>
+        {% for f in all_fields %}
+          <option value="{{ f.id }}" {% if f.id==field.id %}selected{% endif %}>{{ f.name }}</option>
+        {% endfor %}
+      </select>
+      <label>Notes</label><textarea name="notes" rows="2"></textarea>
+      <p><button class="btn">Add Battery</button></p>
+    </form>
+  </div>
+
+  <h2>Existing Batteries</h2>
+  <div class="grid">
+  {% for b in batteries %}
+    <div class="card">
+      <h3>{{ b.name }}</h3>
+      <div class="muted">Field: {{ b.field.name }}</div>
+      {% if b.notes %}<div class="muted">{{ b.notes }}</div>{% endif %}
+      <p class="row">
+        <a class="btn" href="{{ url_for('battery_detail', battery_id=b.id) }}">Open Meters</a>
+        <a class="btn" href="{{ url_for('edit_battery', battery_id=b.id) }}">Edit</a>
+        <form class="inline" method="post" action="{{ url_for('delete_battery', battery_id=b.id) }}" onsubmit="return confirm('Delete this Battery and ALL its meters?');">
+          <button class="btn danger">Delete</button>
+        </form>
+      </p>
+    </div>
+  {% else %}
+    <p>No batteries in this field yet.</p>
+  {% endfor %}
+  </div>
+{% endblock %}
+"""
+
+BATTERY_EDIT = """
+{% extends "base.html" %}
+{% block content %}
+  <h1>Edit Battery</h1>
+  <form method="post">
+    <label>Name</label><input name="name" value="{{ battery.name }}" required />
+    <label>Assign to Field</label>
+    <select name="field_id" required>
+      {% for f in all_fields %}
+        <option value="{{ f.id }}" {% if f.id==battery.field_id %}selected{% endif %}>{{ f.name }}</option>
+      {% endfor %}
+    </select>
+    <label>Notes</label><textarea name="notes" rows="2">{{ battery.notes or '' }}</textarea>
+    <p class="row">
+      <button class="btn">Save Changes</button>
+      <a class="btn" href="{{ url_for('list_batteries', field_id=battery.field_id) }}">Back</a>
+    </p>
+  </form>
+{% endblock %}
+"""
+
+BATTERY_DETAIL = """
+{% extends "base.html" %}
+{% block content %}
+  <h1>{{ battery.name }} — Meters</h1>
+  <p>In Field: <b><a href="{{ url_for('list_batteries', field_id=battery.field.id) }}">{{ battery.field.name }}</a></b></p>
+
+  <div class="card">
+    <h3>Add Meter to {{ battery.name }}</h3>
+    <form method="post" action="{{ url_for('add_meter', battery_id=battery.id) }}">
+      <div class="grid">
+        <div><label>Meter Name</label><input name="meter_name" required /></div>
+        <div><label>Flow Cal ID</label><input name="flow_cal_id" /></div>
+        <div><label>Purchaser Name (optional)</label><input name="purchaser_name" /></div>
+        <div><label>Purchaser Meter ID (optional)</label><input name="purchaser_meter_id" /></div>
+        <div><label>Meter Type</label><input name="meter_type" /></div>
+        <div><label>Meter Address</label><input name="meter_address" /></div>
+        <div><label>Device S/N</label><input name="serial_number" /></div>
+        <div><label>Tube S/N</label><input name="tube_serial_number" /></div>
+        <div><label>Tube Size</label><input name="tube_size" /></div>
+        <div><label>Orifice/Plate Size</label><input name="orifice_plate_size" /></div>
+        <div><label>H2S (PPM)</label><input name="h2s_ppm" /></div>
+        <div>
+          <label>Inspection Frequency</label>
+          <select name="frequency">
+            <option value="">—</option>
+            <option>Monthly</option>
+            <option>Quarterly</option>
+            <option>Semiannual</option>
+            <option>Annual</option>
+            <option>Out of Service</option>
           </select>
         </div>
-        <div class="col-md-2">
-          <button class="btn btn-secondary w-100">Import</button>
-        </div>
-      </form>
+        <div><label>Last Test (YYYY-MM-DD)</label><input name="last_test_date" placeholder="2025-02-26" /></div>
+      </div>
+      <label class="tiny"><input type="checkbox" name="hist_add" /> Also add this to history</label>
+      <div class="note">Next Inspection is auto-calculated from <b>Last Test</b> + <b>Frequency</b>.</div>
+      <label>Notes</label><textarea name="notes" rows="2"></textarea>
+      <p><button class="btn">Add Meter</button></p>
+    </form>
+  </div>
+
+  <h2>Meters in {{ battery.name }}</h2>
+  <div class="grid">
+    {% for m in meters %}
+      <div class="card">
+        <h3>{{ m.meter_name }}</h3>
+        <div class="muted">Flow Cal ID: {{ m.flow_cal_id or '—' }}</div>
+        {% if m.purchaser_name or m.purchaser_meter_id %}
+          <div class="muted">Purchaser: {{ m.purchaser_name or '—' }} | Purchaser Meter ID: {{ m.purchaser_meter_id or '—' }}</div>
+        {% endif %}
+        <div class="muted">Type: {{ m.meter_type or '—' }} | Addr: {{ m.meter_address or '—' }}</div>
+        <div class="muted">Tube: {{ m.tube_size or '—' }} | Plate: {{ m.orifice_plate_size or '—' }} | H2S: {{ m.h2s_ppm or '—' }}</div>
+        <div class="muted">Last Test: {{ m.last_test_date or '—' }}</div>
+        {% if m.frequency %}
+          {% if m.frequency == 'Out of Service' %}
+            <div><span class="pill pill-oos">Out of Service</span></div>
+          {% else %}
+            <div class="muted">Frequency: {{ m.frequency }}</div>
+          {% endif %}
+        {% endif %}
+        <div class="muted">Next Insp: {{ m.next_inspection or '—' }}</div>
+        {% if m.notes %}<p>{{ m.notes }}</p>{% endif %}
+        <p class="row">
+          <a class="btn" href="{{ url_for('edit_meter', meter_id=m.id) }}">Edit</a>
+          <a class="btn" href="{{ url_for('meter_history', meter_id=m.id) }}">History</a>
+          <form class="inline" method="post" action="{{ url_for('delete_meter', meter_id=m.id) }}" onsubmit="return confirm('Delete this Meter?');">
+            <button class="btn danger">Delete</button>
+          </form>
+        </p>
+      </div>
+    {% else %}
+      <p>No meters yet.</p>
+    {% endfor %}
+  </div>
+{% endblock %}
+"""
+
+METER_EDIT = """
+{% extends "base.html" %}
+{% block content %}
+  <h1>Edit Meter</h1>
+  <form method="post">
+    <div class="grid">
+      <div><label>Meter Name</label><input name="meter_name" value="{{ m.meter_name }}" required /></div>
+      <div><label>Flow Cal ID</label><input name="flow_cal_id" value="{{ m.flow_cal_id or '' }}" /></div>
+      <div><label>Purchaser Name (optional)</label><input name="purchaser_name" value="{{ m.purchaser_name or '' }}" /></div>
+      <div><label>Purchaser Meter ID (optional)</label><input name="purchaser_meter_id" value="{{ m.purchaser_meter_id or '' }}" /></div>
+      <div><label>Meter Type</label><input name="meter_type" value="{{ m.meter_type or '' }}" /></div>
+      <div><label>Meter Address</label><input name="meter_address" value="{{ m.meter_address or '' }}" /></div>
+      <div><label>Device S/N</label><input name="serial_number" value="{{ m.serial_number or '' }}" /></div>
+      <div><label>Tube S/N</label><input name="tube_serial_number" value="{{ m.tube_serial_number or '' }}" /></div>
+      <div><label>Tube Size</label><input name="tube_size" value="{{ m.tube_size or '' }}" /></div>
+      <div><label>Orifice/Plate Size</label><input name="orifice_plate_size" value="{{ m.orifice_plate_size or '' }}" /></div>
+      <div><label>H2S (PPM)</label><input name="h2s_ppm" value="{{ m.h2s_ppm or '' }}" /></div>
+      <div>
+        <label>Inspection Frequency</label>
+        <select name="frequency">
+          {% for opt in ["","Monthly","Quarterly","Semiannual","Annual","Out of Service"] %}
+            <option value="{{ opt }}" {% if (m.frequency or '')==opt %}selected{% endif %}>{{ opt or '—' }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div><label>Last Test (YYYY-MM-DD)</label><input name="last_test_date" value="{{ m.last_test_date or '' }}" /></div>
     </div>
+    <label class="tiny"><input type="checkbox" name="hist_add" /> Also add this to history on save</label>
+    <div class="note">Next Inspection is auto-calculated from Last Test + Frequency (after save).</div>
+    <label>Notes</label><textarea name="notes" rows="2">{{ m.notes or '' }}</textarea>
+    <p class="row">
+      <button class="btn">Save Changes</button>
+      <a class="btn" href="{{ url_for('battery_detail', battery_id=m.battery_id) }}">Back</a>
+    </p>
+  </form>
+{% endblock %}
+"""
+
+HISTORY_PAGE = """
+{% extends "base.html" %}
+{% block content %}
+  <h1>History — {{ meter.meter_name }}</h1>
+  <p>Battery: <a href="{{ url_for('battery_detail', battery_id=meter.battery_id) }}">{{ meter.battery.name }}</a> · Field: {{ meter.battery.field.name }}</p>
+
+  <div class="card">
+    <h3>Add History Entry</h3>
+    <form method="post" action="{{ url_for('add_history', meter_id=meter.id) }}">
+      <div class="grid">
+        <div><label>Event Date (YYYY-MM-DD)</label><input name="event_date" placeholder="{{ today }}" required /></div>
+        <div><label>H2S (PPM)</label><input name="h2s_ppm" value="{{ meter.h2s_ppm or '' }}" /></div>
+      </div>
+      <label>Notes</label><textarea name="notes" rows="2"></textarea>
+      <p class="row">
+        <button class="btn">Add</button>
+        <a class="btn" href="{{ url_for('edit_meter', meter_id=meter.id) }}">Edit Meter</a>
+      </p>
+      <p class="tiny">Tip: adding a history entry does not change Next Inspection; use “Mark Tested Today” or change Last Test on the Edit page if you want to roll the schedule.</p>
+    </form>
   </div>
 
   <div class="card">
-    <div class="card-header">Meters — {{ active_station }}</div>
-    <div class="card-body table-responsive">
-      <table class="table table-sm table-striped align-middle">
-        <thead class="table-light sticky">
-          <tr>
-            <th>Meter Name</th>
-            <th>Flow Cal ID</th>
-            <th>Test Date</th>
-            <th>H2S PPM</th>
-            <th>Meter Type</th>
-            <th>Address</th>
-            <th>Serial #</th>
-            <th>Tube S/N</th>
-            <th>Tube Size</th>
-            <th>Orifice Plate</th>
-            <th>Notes</th>
-            <th style="width: 160px;">Actions</th>
-          </tr>
-        </thead>
+    <h3>Entries</h3>
+    {% if history %}
+      <table>
+        <thead><tr><th>Date</th><th>H2S (PPM)</th><th>Notes</th><th>Logged</th><th></th></tr></thead>
         <tbody>
-          {% for m in items %}
+          {% for h in history %}
             <tr>
-              <td>{{ m.meter_name }}</td>
-              <td>{{ m.flow_cal_id or "" }}</td>
-              <td>{{ m.test_date or "" }}</td>
-              <td>{{ m.h2s_ppm if m.h2s_ppm is not none else "" }}</td>
-              <td>{{ m.meter_type or "" }}</td>
-              <td>{{ m.meter_address or "" }}</td>
-              <td>{{ m.serial_number or "" }}</td>
-              <td>{{ m.tube_serial_number or "" }}</td>
-              <td>{{ m.tube_size or "" }}</td>
-              <td>{{ m.orifice_plate_size or "" }}</td>
-              <td style="max-width: 240px; white-space: pre-wrap;">{{ m.notes or "" }}</td>
+              <td>{{ h.event_date }}</td>
+              <td>{{ h.h2s_ppm or '—' }}</td>
+              <td>{{ h.notes or '—' }}</td>
+              <td class="tiny">{{ h.created_at.strftime("%Y-%m-%d %H:%M") }} ({{ h.created_via or 'manual' }})</td>
               <td>
-                <button class="btn btn-sm btn-outline-primary" data-bs-toggle="collapse" data-bs-target="#edit{{ m.id }}">Edit</button>
-                <form method="post" action="{{ url_for('delete_meter', meter_id=m.id) }}" style="display:inline" onsubmit="return confirm('Delete this meter?');">
-                  <button class="btn btn-sm btn-outline-danger">Delete</button>
-                </form>
-              </td>
-            </tr>
-            <tr class="collapse" id="edit{{ m.id }}">
-              <td colspan="12">
-                <form method="post" action="{{ url_for('edit_meter', meter_id=m.id) }}" class="row g-2">
-                  <div class="col-md-2">
-                    <label class="form-label">Station</label>
-                    <select name="station" class="form-select">
-                      {% for s in stations %}
-                        <option value="{{ s }}" {% if s == m.station %}selected{% endif %}>{{ s }}</option>
-                      {% endfor %}
-                    </select>
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Meter Name *</label>
-                    <input name="meter_name" class="form-control" value="{{ m.meter_name }}" required>
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Flow Cal ID</label>
-                    <input name="flow_cal_id" class="form-control" value="{{ m.flow_cal_id or '' }}">
-                  </div>
-                  <div class="col-md-2">
-                    <label class="form-label">Test Date</label>
-                    <input type="date" name="test_date" class="form-control" value="{{ m.test_date }}">
-                  </div>
-                  <div class="col-md-2">
-                    <label class="form-label">H2S PPM</label>
-                    <input name="h2s_ppm" class="form-control" value="{{ m.h2s_ppm if m.h2s_ppm is not none else '' }}">
-                  </div>
-
-                  <div class="col-md-3">
-                    <label class="form-label">Meter Type</label>
-                    <input name="meter_type" class="form-control" value="{{ m.meter_type or '' }}">
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Meter Address</label>
-                    <input name="meter_address" class="form-control" value="{{ m.meter_address or '' }}">
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Serial Number</label>
-                    <input name="serial_number" class="form-control" value="{{ m.serial_number or '' }}">
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Tube Serial Number</label>
-                    <input name="tube_serial_number" class="form-control" value="{{ m.tube_serial_number or '' }}">
-                  </div>
-
-                  <div class="col-md-3">
-                    <label class="form-label">Tube Size</label>
-                    <input name="tube_size" class="form-control" value="{{ m.tube_size or '' }}">
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Orifice Plate Size</label>
-                    <input name="orifice_plate_size" class="form-control" value="{{ m.orifice_plate_size or '' }}">
-                  </div>
-                  <div class="col-md-12">
-                    <label class="form-label">Notes</label>
-                    <textarea name="notes" class="form-control" rows="2">{{ m.notes or '' }}</textarea>
-                  </div>
-
-                  <div class="col-12">
-                    <button class="btn btn-primary">Save</button>
-                  </div>
+                <form class="inline" method="post" action="{{ url_for('delete_history', hist_id=h.id) }}" onsubmit="return confirm('Delete this history entry?');">
+                  <button class="btn danger">Delete</button>
                 </form>
               </td>
             </tr>
           {% endfor %}
         </tbody>
       </table>
-
-      {% if not items %}
-        <div class="text-muted">No meters yet for {{ active_station }}. Add some above or import from Excel.</div>
-      {% endif %}
-    </div>
+    {% else %}
+      <div class="muted">No history yet.</div>
+    {% endif %}
   </div>
-</div>
-
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
+{% endblock %}
 """
 
-# -------------------- Main --------------------
-if __name__ == "__main__":
-    # Enable SQLite WAL for better concurrent reads/writes
-    try:
-        with engine.begin() as conn:
-            conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
-            conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
-    except Exception:
-        pass
+# register base template
+app.jinja_loader = ChoiceLoader([app.jinja_loader, DictLoader({"base.html": BASE})])
 
-    app.run(host="127.0.0.1", port=5000, debug=True)
+# ------------------------
+# Routes
+# ------------------------
+@app.route("/")
+def home():
+    fields = Field.query.options(
+        joinedload(Field.batteries).joinedload(Battery.meters)
+    ).order_by(Field.name).all()
+
+    week_start, week_end = week_bounds()
+    due_q = (Meter.query
+             .options(joinedload(Meter.battery).joinedload(Battery.field))
+             .filter(Meter.frequency.isnot(None),
+                     Meter.frequency != "Out of Service",
+                     Meter.next_inspection.isnot(None),
+                     Meter.next_inspection <= week_end))
+    due_all = sorted(due_q.all(),
+        key=lambda m: (m.battery.field.name, m.battery.name, m.next_inspection, m.meter_name))
+    overdue = [m for m in due_all if m.next_inspection < week_start]
+    due_week = [m for m in due_all if week_start <= m.next_inspection <= week_end]
+
+    return render_template_string(HOME,
+        fields=fields, week_start=week_start, week_end=week_end,
+        overdue=overdue, due_week=due_week, quick_reasons=QUICK_REASONS)
+
+@app.route("/due")
+def due():
+    week_start, week_end = week_bounds()
+    due_q = (Meter.query
+             .options(joinedload(Meter.battery).joinedload(Battery.field))
+             .filter(Meter.frequency.isnot(None),
+                     Meter.frequency != "Out of Service",
+                     Meter.next_inspection.isnot(None),
+                     Meter.next_inspection <= week_end))
+    due_all = sorted(due_q.all(),
+        key=lambda m: (m.battery.field.name, m.battery.name, m.next_inspection, m.meter_name))
+    overdue = [m for m in due_all if m.next_inspection < week_start]
+    due_week = [m for m in due_all if week_start <= m.next_inspection <= week_end]
+    return render_template_string(DUE_PAGE,
+        overdue=overdue, due_week=due_week, week_start=week_start, week_end=week_end,
+        quick_reasons=QUICK_REASONS)
+
+# ---- History ----
+@app.route("/meters/<int:meter_id>/history")
+def meter_history(meter_id):
+    m = Meter.query.options(joinedload(Meter.battery).joinedload(Battery.field)).get_or_404(meter_id)
+    history = MeterHistory.query.filter_by(meter_id=m.id).order_by(MeterHistory.event_date.desc(), MeterHistory.id.desc()).all()
+    return render_template_string(HISTORY_PAGE, meter=m, history=history, today=date.today())
+
+@app.route("/meters/<int:meter_id>/history/add", methods=["POST"])
+def add_history(meter_id):
+    m = Meter.query.get_or_404(meter_id)
+    ev = parse_ymd(request.form.get("event_date"))
+    if not ev:
+        flash("Event date is required (YYYY-MM-DD).")
+        return redirect(url_for("meter_history", meter_id=m.id))
+    h = MeterHistory(
+        meter_id=m.id,
+        event_date=ev,
+        h2s_ppm=(request.form.get("h2s_ppm") or None),
+        notes=(request.form.get("notes") or None),
+        created_via="manual",
+    )
+    db.session.add(h)
+    db.session.commit()
+    flash("History entry added.")
+    return redirect(url_for("meter_history", meter_id=m.id))
+
+@app.route("/history/<int:hist_id>/delete", methods=["POST"])
+def delete_history(hist_id):
+    h = MeterHistory.query.get_or_404(hist_id)
+    meter_id = h.meter_id
+    db.session.delete(h)
+    db.session.commit()
+    flash("History entry deleted.")
+    return redirect(url_for("meter_history", meter_id=meter_id))
+
+# ---- Fields ----
+@app.route("/fields")
+def list_fields():
+    fields = Field.query.order_by(Field.name).all()
+    return render_template_string(FIELDS, fields=fields)
+
+@app.route("/fields/add", methods=["POST"])
+def add_field():
+    name = request.form.get("name","").strip()
+    if not name:
+        flash("Field name is required.")
+        return redirect(url_for("list_fields"))
+    location = request.form.get("location","").strip() or None
+    if Field.query.filter_by(name=name).first():
+        flash("Field already exists.")
+        return redirect(url_for("list_fields"))
+    db.session.add(Field(name=name, location=location))
+    db.session.commit()
+    flash(f"Field '{name}' added.")
+    return redirect(url_for("list_fields"))
+
+@app.route("/fields/<int:field_id>/edit", methods=["GET","POST"])
+def edit_field(field_id):
+    field = Field.query.get_or_404(field_id)
+    if request.method == "POST":
+        field.name = request.form.get("name","").strip() or field.name
+        field.location = request.form.get("location","").strip() or None
+        db.session.commit()
+        flash("Field updated.")
+        return redirect(url_for("list_batteries", field_id=field.id))
+    return render_template_string(FIELD_EDIT, field=field)
+
+# ---- Batteries ----
+@app.route("/fields/<int:field_id>/batteries")
+def list_batteries(field_id):
+    field = Field.query.get_or_404(field_id)
+    batteries = Battery.query.filter_by(field_id=field.id).order_by(Battery.name).all()
+    all_fields = Field.query.order_by(Field.name).all()
+    return render_template_string(BATTERIES, field=field, batteries=batteries, all_fields=all_fields)
+
+@app.route("/batteries/add", methods=["POST"])
+def add_battery():
+    name = request.form.get("name","").strip()
+    field_id = request.form.get("field_id")
+    if not name or not field_id:
+        flash("Battery name and Field are required.")
+        return redirect(url_for("list_fields"))
+    notes = request.form.get("notes","").strip() or None
+    field = Field.query.get_or_404(int(field_id))
+    b = Battery(name=name, notes=notes, field_id=field.id)
+    db.session.add(b)
+    db.session.commit()
+    flash(f"Battery '{name}' added to {field.name}.")
+    return redirect(url_for("list_batteries", field_id=field.id))
+
+@app.route("/batteries/<int:battery_id>/edit", methods=["GET","POST"])
+def edit_battery(battery_id):
+    battery = Battery.query.get_or_404(battery_id)
+    if request.method == "POST":
+        battery.name = request.form.get("name","").strip() or battery.name
+        new_field_id = int(request.form.get("field_id"))
+        battery.field_id = new_field_id
+        battery.notes = request.form.get("notes","").strip() or None
+        db.session.commit()
+        flash("Battery updated.")
+        return redirect(url_for("list_batteries", field_id=new_field_id))
+    all_fields = Field.query.order_by(Field.name).all()
+    return render_template_string(BATTERY_EDIT, battery=battery, all_fields=all_fields)
+
+@app.route("/batteries/<int:battery_id>/delete", methods=["POST"])
+def delete_battery(battery_id):
+    battery = Battery.query.get_or_404(battery_id)
+    field_id = battery.field_id
+    db.session.delete(battery)  # cascades to meters
+    db.session.commit()
+    flash("Battery deleted.")
+    return redirect(url_for("list_batteries", field_id=field_id))
+
+@app.route("/batteries/<int:battery_id>")
+def battery_detail(battery_id):
+    battery = Battery.query.get_or_404(battery_id)
+    meters = Meter.query.filter_by(battery_id=battery.id).order_by(Meter.meter_name).all()
+    return render_template_string(BATTERY_DETAIL, battery=battery, meters=meters)
+
+# ---- Meters ----
+@app.route("/batteries/<int:battery_id>/meters/add", methods=["POST"])
+def add_meter(battery_id):
+    battery = Battery.query.get_or_404(battery_id)
+    f = request.form
+    last = parse_ymd(f.get("last_test_date"))
+    freq = f.get("frequency") or None
+    next_calc = compute_next(last, freq)
+
+    m = Meter(
+        meter_name=f.get("meter_name","").strip(),
+        flow_cal_id=f.get("flow_cal_id") or None,
+        purchaser_name=f.get("purchaser_name") or None,
+        purchaser_meter_id=f.get("purchaser_meter_id") or None,
+        meter_type=f.get("meter_type") or None,
+        meter_address=f.get("meter_address") or None,
+        serial_number=f.get("serial_number") or None,
+        tube_serial_number=f.get("tube_serial_number") or None,
+        tube_size=f.get("tube_size") or None,
+        orifice_plate_size=f.get("orifice_plate_size") or None,
+        h2s_ppm=f.get("h2s_ppm") or None,
+        notes=f.get("notes") or None,
+        frequency=freq,
+        last_test_date=last,
+        next_inspection=next_calc,
+        battery_id=battery.id,
+    )
+    if not m.meter_name:
+        flash("Meter Name is required.")
+        return redirect(url_for("battery_detail", battery_id=battery.id))
+    db.session.add(m)
+    db.session.commit()
+
+    if "hist_add" in f and last:
+        db.session.add(MeterHistory(meter_id=m.id, event_date=last, h2s_ppm=m.h2s_ppm, notes=m.notes, created_via="manual"))
+        db.session.commit()
+
+    flash(f"Meter '{m.meter_name}' added to {battery.name}.")
+    return redirect(url_for("battery_detail", battery_id=battery.id))
+
+@app.route("/meters/<int:meter_id>/edit", methods=["GET","POST"])
+def edit_meter(meter_id):
+    m = Meter.query.get_or_404(meter_id)
+    if request.method == "POST":
+        f = request.form
+        m.meter_name = f.get("meter_name","").strip() or m.meter_name
+        m.flow_cal_id = f.get("flow_cal_id") or None
+        m.purchaser_name = f.get("purchaser_name") or None
+        m.purchaser_meter_id = f.get("purchaser_meter_id") or None
+        m.meter_type = f.get("meter_type") or None
+        m.meter_address = f.get("meter_address") or None
+        m.serial_number = f.get("serial_number") or None
+        m.tube_serial_number = f.get("tube_serial_number") or None
+        m.tube_size = f.get("tube_size") or None
+        m.orifice_plate_size = f.get("orifice_plate_size") or None
+        m.h2s_ppm = f.get("h2s_ppm") or None
+        m.frequency = f.get("frequency") or None
+        new_last = parse_ymd(f.get("last_test_date"))
+        m.last_test_date = new_last
+        m.next_inspection = compute_next(m.last_test_date, m.frequency)
+        m.notes = f.get("notes") or None
+        db.session.commit()
+
+        if "hist_add" in f and new_last:
+            db.session.add(MeterHistory(meter_id=m.id, event_date=new_last, h2s_ppm=m.h2s_ppm, notes=m.notes, created_via="edit"))
+            db.session.commit()
+
+        flash("Meter updated.")
+        return redirect(url_for("battery_detail", battery_id=m.battery_id))
+    return render_template_string(METER_EDIT, m=m)
+
+@app.route("/meters/<int:meter_id>/delete", methods=["POST"])
+def delete_meter(meter_id):
+    m = Meter.query.get_or_404(meter_id)
+    battery_id = m.battery_id
+    db.session.delete(m)
+    db.session.commit()
+    flash("Meter deleted.")
+    return redirect(url_for("battery_detail", battery_id=battery_id))
+
+@app.route("/meters/<int:meter_id>/mark_tested", methods=["POST"])
+def mark_tested_today(meter_id):
+    """Set last_test_date=today, optionally update H2S, roll next_inspection, and log history with quick reason."""
+    m = Meter.query.get_or_404(meter_id)
+    today = date.today()
+
+    new_h2s = (request.form.get("new_h2s") or "").strip()
+    reason = (request.form.get("reason") or "").strip()
+    note_in = (request.form.get("note") or "").strip()
+
+    if new_h2s != "":
+        m.h2s_ppm = new_h2s
+
+    m.last_test_date = today
+    m.next_inspection = compute_next(today, m.frequency)
+
+    parts = []
+    if reason and reason != "—":
+        parts.append(reason)
+    if note_in:
+        parts.append(note_in)
+    if not parts:
+        parts.append("Marked tested" + ("" if new_h2s != "" else " (no H2S sample)"))
+    hist_note = " — ".join(parts)
+
+    hist_h2s = new_h2s if new_h2s != "" else None
+
+    db.session.add(MeterHistory(
+        meter_id=m.id,
+        event_date=today,
+        h2s_ppm=hist_h2s,
+        notes=hist_note,
+        created_via="mark_tested",
+    ))
+    db.session.commit()
+
+    flash(f"Marked '{m.meter_name}' as tested on {today}.")
+    back = request.args.get("back")
+    return redirect(url_for("due" if back == "due" else "home"))
+
+# ------------------------
+# Jinja base registration (inline base.html)
+# ------------------------
+app.jinja_loader = ChoiceLoader([app.jinja_loader, DictLoader({"base.html": BASE})])
+
+# ------------------------
+# Run
+# ------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Starting on port {port} — DB: {DB_URI}")
+    app.run(host="0.0.0.0", port=port, debug=False)
+
